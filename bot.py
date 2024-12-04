@@ -6,6 +6,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 from email_service import verify_email
 from tempfile import NamedTemporaryFile
 from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 
 # Configure Logging
 logging.basicConfig(
@@ -15,77 +16,83 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-# Concurrent Email Validation
-def check_emails_concurrently(email_list, max_workers=50):
-    valid_emails = []
-    syntax_errors = []
-    domain_errors = []
-    server_errors = []
+# Concurrent Email Validation with Streaming to Files
+def check_emails_streaming(email_list, max_workers=10000):
+    """
+    Validate Emails Concurrently And Write Results To Files Immediately.
+    """
+    # Prepare File Locks For Thread-Safe Writing
+    locks = {
+        "valid": Lock(),
+        "syntax": Lock(),
+        "domain": Lock(),
+        "server": Lock(),
+    }
+
+    # Create Temporary Files For Results
+    result_files = {
+        "valid": NamedTemporaryFile(delete=False, suffix=".txt", mode="w"),
+        "syntax": NamedTemporaryFile(delete=False, suffix=".txt", mode="w"),
+        "domain": NamedTemporaryFile(delete=False, suffix=".txt", mode="w"),
+        "server": NamedTemporaryFile(delete=False, suffix=".txt", mode="w"),
+    }
 
     def process_email(index, email):
-        print(f"Checking Email {index + 1}/{len(email_list)}: {email}")
+        print(f"Processing Email {index + 1}/{len(email_list)}: {email}")
         try:
             result = verify_email(email)
-            if result == "valid":
-                valid_emails.append(email)
-            elif result == "syntax":
-                syntax_errors.append(email)
-            elif result == "domain":
-                domain_errors.append(email)
-            elif result == "server":
-                server_errors.append(email)
+            # Write To The Appropriate File
+            with locks[result]:
+                result_files[result].write(email + "\n")
         except Exception as e:
             logging.error("Error While Processing Email %s: %s", email, str(e))
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         executor.map(lambda args: process_email(*args), enumerate(email_list))
 
-    return valid_emails, syntax_errors, domain_errors, server_errors
+    # Close All Files
+    for file in result_files.values():
+        file.close()
+
+    return {key: file.name for key, file in result_files.items()}
 
 # Handle Uploaded File
 async def handle_file(update: Update, context):
     start_time = time.time()
 
     try:
+        # Download File Sent By User
         file = await update.message.document.get_file()
         temp_file = NamedTemporaryFile(delete=False, suffix=".txt")
         await file.download_to_drive(temp_file.name)
         logging.info("File Successfully Downloaded: %s", temp_file.name)
 
+        # Read File Content
         with open(temp_file.name, "r") as f:
             email_list = f.read().splitlines()
 
-        valid_emails, syntax_errors, domain_errors, server_errors = check_emails_concurrently(email_list, max_workers=10)
+        # Validate Emails With Streaming
+        result_files = check_emails_streaming(email_list, max_workers=500)
 
-        result_files = {
-            "valid_emails.txt": valid_emails,
-            "syntax_errors.txt": syntax_errors,
-            "domain_errors.txt": domain_errors,
-            "server_errors.txt": server_errors,
-        }
-
-        for filename, emails in result_files.items():
-            temp_file = NamedTemporaryFile(delete=False, suffix=".txt")
-            with open(temp_file.name, "w") as f:
-                f.write("\n".join(emails))
-            temp_file.close()
-            result_files[filename] = temp_file.name
-
-        for filename, filepath in result_files.items():
+        # Send Files Back To User
+        for category, filepath in result_files.items():
             if os.path.getsize(filepath) > 0:
                 with open(filepath, "rb") as file_to_send:
-                    await update.message.reply_document(document=file_to_send, filename=filename)
+                    await update.message.reply_document(
+                        document=file_to_send,
+                        filename=f"{category}_emails.txt"
+                    )
             else:
-                await update.message.reply_text(f"{filename} Is Empty And Was Not Sent.")
+                await update.message.reply_text(f"{category}_emails.txt Is Empty And Was Not Sent.")
 
+        # Calculate And Send Processing Time
         elapsed_time = time.time() - start_time
+        emails_per_second = len(email_list) / elapsed_time if elapsed_time > 0 else 0
+
         stats_message = (
             f"Processing Completed In {elapsed_time:.2f} Seconds.\n"
             f"Total Emails: {len(email_list)}\n"
-            f"Valid Emails: {len(valid_emails)}\n"
-            f"Syntax Errors: {len(syntax_errors)}\n"
-            f"Domain Errors: {len(domain_errors)}\n"
-            f"Server Errors: {len(server_errors)}"
+            f"Emails Processed Per Second: {emails_per_second:.2f}"
         )
         await update.message.reply_text(stats_message)
 

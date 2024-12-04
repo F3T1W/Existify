@@ -2,6 +2,7 @@ import re
 import smtplib
 import dns.resolver
 import logging
+from functools import lru_cache
 
 # Configure Logging
 logging.basicConfig(
@@ -11,62 +12,49 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
+EMAIL_REGEX = re.compile(r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$")
+
 # Syntax Check
 def is_syntax_valid(email):
-    """
-    Validate Email Syntax Using Regex.
-    """
-    regex = r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$"
-    return re.match(regex, email) is not None
+    return EMAIL_REGEX.match(email) is not None
 
-# Domain Check
-def is_domain_valid(email):
+@lru_cache(maxsize=1000)
+def is_domain_valid_cached(domain):
     try:
-        domain = email.split('@')[1]
         resolver = dns.resolver.Resolver()
-        resolver.timeout = 5
-        resolver.lifetime = 5
+        resolver.timeout = 3
+        resolver.lifetime = 3
         answers = resolver.resolve(domain, 'MX')
         logging.info("Domain %s Has MX Records: %s", domain, [r.exchange.to_text() for r in answers])
         return True
-    except dns.resolver.NoAnswer:
-        logging.warning("Domain %s Does Not Have MX Records", domain)
-        return False
-    except dns.resolver.NXDOMAIN:
-        logging.warning("Domain %s Does Not Exist", domain)
+    except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+        logging.warning("Domain %s Is Invalid", domain)
         return False
     except Exception as e:
         logging.error("Error While Checking Domain %s: %s", domain, str(e))
         return False
 
-# SMTP Server Check
 def check_email_server(email):
     try:
         domain = email.split('@')[1]
+        if not is_domain_valid_cached(domain):
+            return False
+
         mx_records = dns.resolver.resolve(domain, 'MX')
         mx_record = mx_records[0].exchange.to_text()
-        logging.info("Found MX Record For Domain %s: %s", domain, mx_record)
-
-        with smtplib.SMTP(mx_record) as smtp:
-            smtp.set_debuglevel(0)
+        with smtplib.SMTP(mx_record, timeout=5) as smtp:
             smtp.helo()
             smtp.mail("test@example.com")
             code, _ = smtp.rcpt(email)
-            success = code == 250
-            logging.info("SMTP Server Response For Email %s: %s", email, "Success" if success else "Failed")
-            return success
+            return code == 250
     except Exception as e:
         logging.error("Error While Validating Email Server %s: %s", email, str(e))
         return False
 
-# Full Email Validation
 def verify_email(email):
-    """
-    Perform Full Validation Of Email: Syntax, Domain, SMTP.
-    """
     if not is_syntax_valid(email):
         return "syntax"
-    if not is_domain_valid(email):
+    if not is_domain_valid_cached(email.split('@')[1]):
         return "domain"
     if not check_email_server(email):
         return "server"
