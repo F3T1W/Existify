@@ -72,9 +72,13 @@ async def handle_file(update: Update, context):
             email_list = f.read().splitlines()
 
         # Validate Emails With Streaming
+        validation_start_time = time.time()
         result_files = check_emails_streaming(email_list, max_workers=500)
+        validation_end_time = time.time()
+        validation_time = validation_end_time - validation_start_time
 
         # Send Files Back To User
+        file_start_time = time.time()
         for category, filepath in result_files.items():
             if os.path.getsize(filepath) > 0:
                 with open(filepath, "rb") as file_to_send:
@@ -84,6 +88,8 @@ async def handle_file(update: Update, context):
                     )
             else:
                 await update.message.reply_text(f"{category}_emails.txt Is Empty And Was Not Sent.")
+        file_end_time = time.time()
+        file_handling_time = file_end_time - file_start_time
 
         # Calculate And Send Processing Time
         elapsed_time = time.time() - start_time
@@ -92,8 +98,15 @@ async def handle_file(update: Update, context):
         stats_message = (
             f"Processing Completed In {elapsed_time:.2f} Seconds.\n"
             f"Total Emails: {len(email_list)}\n"
-            f"Emails Processed Per Second: {emails_per_second:.2f}"
+            f"Emails Processed Per Second: {emails_per_second:.2f}\n"
+            f"Validation Time: {validation_time:.2f} Seconds\n"
+            f"File Handling Time: {file_handling_time:.2f} Seconds"
         )
+
+        # Log file handling and validation times
+        logging.info(f"Validation Time: {validation_time:.2f} seconds.")
+        logging.info(f"File Handling Time: {file_handling_time:.2f} seconds.")
+
         await update.message.reply_text(stats_message)
 
     except Exception as e:
