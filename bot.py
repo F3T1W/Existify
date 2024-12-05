@@ -1,6 +1,7 @@
 import os
 import logging
 import time
+from datetime import datetime
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
 from email_service import verify_email
@@ -16,12 +17,15 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
+# Create uploads directory if it doesn't exist
+UPLOADS_DIR = os.path.join(os.getcwd(), "uploads")
+os.makedirs(UPLOADS_DIR, exist_ok=True)
+
 # Concurrent Email Validation with Streaming to Files
 def check_emails_streaming(email_list, max_workers=10000):
     """
     Validate Emails Concurrently And Write Results To Files Immediately.
     """
-    # Prepare File Locks For Thread-Safe Writing
     locks = {
         "valid": Lock(),
         "syntax": Lock(),
@@ -29,7 +33,6 @@ def check_emails_streaming(email_list, max_workers=10000):
         "server": Lock(),
     }
 
-    # Create Temporary Files For Results
     result_files = {
         "valid": NamedTemporaryFile(delete=False, suffix=".txt", mode="w"),
         "syntax": NamedTemporaryFile(delete=False, suffix=".txt", mode="w"),
@@ -41,7 +44,6 @@ def check_emails_streaming(email_list, max_workers=10000):
         print(f"Processing Email {index + 1}/{len(email_list)}: {email}")
         try:
             result = verify_email(email)
-            # Write To The Appropriate File
             with locks[result]:
                 result_files[result].write(email + "\n")
         except Exception as e:
@@ -50,7 +52,6 @@ def check_emails_streaming(email_list, max_workers=10000):
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         executor.map(lambda args: process_email(*args), enumerate(email_list))
 
-    # Close All Files
     for file in result_files.values():
         file.close()
 
@@ -63,22 +64,25 @@ async def handle_file(update: Update, context):
     try:
         # Download File Sent By User
         file = await update.message.document.get_file()
-        temp_file = NamedTemporaryFile(delete=False, suffix=".txt")
-        await file.download_to_drive(temp_file.name)
-        logging.info("File Successfully Downloaded: %s", temp_file.name)
+
+        # Generate unique file name
+        sender_name = update.message.from_user.username or update.message.from_user.first_name or "unknown_user"
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        file_name = f"{sender_name}_{timestamp}.txt"
+        file_path = os.path.join(UPLOADS_DIR, file_name)
+
+        # Save file to uploads directory
+        await file.download_to_drive(file_path)
+        logging.info("File Successfully Saved: %s", file_path)
 
         # Read File Content
-        with open(temp_file.name, "r") as f:
+        with open(file_path, "r") as f:
             email_list = f.read().splitlines()
 
         # Validate Emails With Streaming
-        validation_start_time = time.time()
         result_files = check_emails_streaming(email_list, max_workers=500)
-        validation_end_time = time.time()
-        validation_time = validation_end_time - validation_start_time
 
         # Send Files Back To User
-        file_start_time = time.time()
         for category, filepath in result_files.items():
             if os.path.getsize(filepath) > 0:
                 with open(filepath, "rb") as file_to_send:
@@ -88,8 +92,6 @@ async def handle_file(update: Update, context):
                     )
             else:
                 await update.message.reply_text(f"{category}_emails.txt Is Empty And Was Not Sent.")
-        file_end_time = time.time()
-        file_handling_time = file_end_time - file_start_time
 
         # Calculate And Send Processing Time
         elapsed_time = time.time() - start_time
@@ -98,15 +100,8 @@ async def handle_file(update: Update, context):
         stats_message = (
             f"Processing Completed In {elapsed_time:.2f} Seconds.\n"
             f"Total Emails: {len(email_list)}\n"
-            f"Emails Processed Per Second: {emails_per_second:.2f}\n"
-            f"Validation Time: {validation_time:.2f} Seconds\n"
-            f"File Handling Time: {file_handling_time:.2f} Seconds"
+            f"Emails Processed Per Second: {emails_per_second:.2f}"
         )
-
-        # Log file handling and validation times
-        logging.info(f"Validation Time: {validation_time:.2f} seconds.")
-        logging.info(f"File Handling Time: {file_handling_time:.2f} seconds.")
-
         await update.message.reply_text(stats_message)
 
     except Exception as e:
