@@ -2,12 +2,15 @@ import os
 import logging
 import time
 from datetime import datetime
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters
-from email_service import verify_email
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
 from tempfile import NamedTemporaryFile
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
+
+from aiogram.types import InputFile, FSInputFile
+
+from email_service import verify_email
 
 # Configure Logging
 logging.basicConfig(
@@ -17,6 +20,11 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
+# Initialize bot and dispatcher
+BOT_TOKEN = "7859648875:AAG_fOtVhuLqgbavv-FXzxLychLXniBy2Do"
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
 # Create uploads directory if it doesn't exist
 UPLOADS_DIR = os.path.join(os.getcwd(), "uploads")
 os.makedirs(UPLOADS_DIR, exist_ok=True)
@@ -24,7 +32,7 @@ os.makedirs(UPLOADS_DIR, exist_ok=True)
 # Concurrent Email Validation with Streaming to Files
 def check_emails_streaming(email_list, max_workers=10000):
     """
-    Validate Emails Concurrently And Write Results To Files Immediately.
+    Validate emails concurrently and write results to files immediately.
     """
     locks = {
         "valid": Lock(),
@@ -41,13 +49,15 @@ def check_emails_streaming(email_list, max_workers=10000):
     }
 
     def process_email(index, email):
-        print(f"Processing Email {index + 1}/{len(email_list)}: {email}")
         try:
+            # Log the current email being processed
+            logging.info("Processing email %d/%d: %s", index + 1, len(email_list), email)
+
             result = verify_email(email)
             with locks[result]:
                 result_files[result].write(email + "\n")
         except Exception as e:
-            logging.error("Error While Processing Email %s: %s", email, str(e))
+            logging.error("Error processing email %s: %s", email, str(e))
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         executor.map(lambda args: process_email(*args), enumerate(email_list))
@@ -57,71 +67,72 @@ def check_emails_streaming(email_list, max_workers=10000):
 
     return {key: file.name for key, file in result_files.items()}
 
-# Handle Uploaded File
-async def handle_file(update: Update, context):
+# Handler for /start command
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message):
+    await message.answer("Hello! Send me a .txt file containing emails, and I will validate them.")
+
+# Handler for uploaded .txt files
+@dp.message(lambda message: message.document and message.document.file_name.endswith(".txt"))
+async def handle_file(message: types.Message):
     start_time = time.time()
-
     try:
-        # Download File Sent By User
-        file = await update.message.document.get_file()
-
-        # Generate unique file name
-        sender_name = update.message.from_user.username or update.message.from_user.first_name or "unknown_user"
+        # Download the file
+        file = await bot.download(message.document)
+        sender_name = message.from_user.username or message.from_user.first_name or "unknown_user"
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         file_name = f"{sender_name}_{timestamp}.txt"
         file_path = os.path.join(UPLOADS_DIR, file_name)
 
-        # Save file to uploads directory
-        await file.download_to_drive(file_path)
-        logging.info("File Successfully Saved: %s", file_path)
+        # Save file locally
+        with open(file_path, "wb") as f:
+            f.write(file.read())
+        logging.info("File successfully saved: %s", file_path)
 
-        # Read File Content
+        # Read file content
         with open(file_path, "r") as f:
             email_list = f.read().splitlines()
 
-        # Validate Emails With Streaming
-        result_files = check_emails_streaming(email_list, max_workers=500)
+        # Validate emails
+        result_files = check_emails_streaming(email_list)
 
-        # Send Files Back To User
+        # Send result files to user
         for category, filepath in result_files.items():
             if os.path.getsize(filepath) > 0:
-                with open(filepath, "rb") as file_to_send:
-                    await update.message.reply_document(
-                        document=file_to_send,
-                        filename=f"{category}_emails.txt"
-                    )
+                # Use FSInputFile to send the file
+                file_to_send = FSInputFile(filepath)
+                await message.answer_document(file_to_send, caption=f"{category}_emails.txt")
             else:
-                await update.message.reply_text(f"{category}_emails.txt Is Empty And Was Not Sent.")
+                await message.answer(f"{category}_emails.txt is empty and was not sent.")
 
-        # Calculate And Send Processing Time
+        # Send processing stats
         elapsed_time = time.time() - start_time
         emails_per_second = len(email_list) / elapsed_time if elapsed_time > 0 else 0
-
         stats_message = (
-            f"Processing Completed In {elapsed_time:.2f} Seconds.\n"
-            f"Total Emails: {len(email_list)}\n"
-            f"Emails Processed Per Second: {emails_per_second:.2f}"
+            f"Processing completed in {elapsed_time:.2f} seconds.\n"
+            f"Total emails: {len(email_list)}\n"
+            f"Emails processed per second: {emails_per_second:.2f}"
         )
-        await update.message.reply_text(stats_message)
+        await message.answer(stats_message)
 
     except Exception as e:
-        logging.error("Error While Processing File: %s", str(e))
-        await update.message.reply_text("An Error Occurred While Processing The File.")
+        logging.error("Error while processing file: %s", str(e))
+        await message.answer("An error occurred while processing the file.")
 
-# Start Command
-async def start_command(update: Update, context):
-    await update.message.reply_text(
-        "Hello! Send Me A .txt File Containing Emails, And I Will Validate Them."
-    )
 
-# Main Application
+# Error handler
+@dp.errors()
+async def handle_errors(update: types.Update, exception: Exception):
+    logging.error(f"Update {update} caused error {exception}")
+
+# Start polling
+async def main():
+    await dp.start_polling(bot)
+
 if __name__ == "__main__":
-    TOKEN = "7859648875:AAG_fOtVhuLqgbavv-FXzxLychLXniBy2Do"
+    import asyncio
+    import sys
 
-    app = ApplicationBuilder().token(TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(MessageHandler(filters.Document.FileExtension("txt"), handle_file))
-
-    logging.info("Bot Started...")
-    app.run_polling()
+    if sys.platform.startswith("win"):
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    asyncio.run(main())
